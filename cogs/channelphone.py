@@ -1,0 +1,845 @@
+import checksfrfr
+from gil_utility.gperms import *
+"""
+Please put your authorization in line 42.
+
+Also, read the important note on line 60.
+Please implement the following code on line 60 if you are unsure.
+
+```python
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://crystal.econuker.xyz/v1/server/{server.id}/automod/?content={content}") as response:
+                blocked = (await response.json())["automodded"]
+```
+
+Please note that the userphone server is extremely strict. You cannot be missing keys, and they must match the type as expected exactly.
+
+Authorization must be correct, or you could be ratelimited.
+
+Finally, replying is finicky. In order for it to work, you must pass the message IDs as given back to the server.
+
+This means having a map to convert it back and forth, like in this working example.
+- A normal message reply can be sent back directly to the server.
+- A reply to a message from the bot should be mapped back to the original message_id from the cache.
+
+This applies the other way around as well.
+- Receiving reply messages, should attempt to get the message_id from the map, so it gets converted to the bot message. Otherwise, it's a normal message.
+"""
+
+import asyncio, time, re
+import json
+import websockets, aiohttp
+
+import guilded
+from guilded.ext import commands
+from guilded.embed import EmptyEmbed
+#import certifi
+
+#ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+image_regex = re.compile(r"!\[\]\((https:\/\/[^\s]+)\)")
+
+class Channelphone(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+        self.USER_DATA = {
+            "authentication": "ªÃ¼¼Ã±¸63vG”Ã„™¢b8€Qa©µ€L[ZJ!y§lpv·Ž±Ã››N³T ", # Your auth here
+            "name": bot.user.name,
+            "id": bot.user_id,
+            "description": None,
+            "avatar_url": (
+                bot.user.avatar.url if bot.user.avatar else bot.user.default_avatar
+            ),
+        }
+
+        self.session_tasks: list[asyncio.Task] = []
+
+        self.uri = "wss://crystal.econuker.xyz/v1/userphone/"
+        if not hasattr(self.bot, "active_userphone_sessions"):
+            self.bot.active_userphone_sessions = {}
+
+        asyncio.create_task(self.restart_sessions())
+
+    async def would_be_automodded(self, content, server, bot):
+        # NOTE: You should have code to check if this would be blocked by the server automod.
+        # NOTE: You can use Crystal's API to check for Crystal's automod.
+        "https://crystal.econuker.xyz/v1/server/{id}/automod?content=CONTENT"  # GET post, returns {"automodded": bool}
+        return False
+
+    async def find_first_image_or_gif(self, message_content):
+        matches = image_regex.findall(message_content)
+
+        async with aiohttp.ClientSession() as session:
+            for url in matches:
+                async with session.get(url) as response:
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if "image" in content_type or "gif" in content_type:
+                        return url
+        return None
+
+    async def userphone_session(
+        self, session: dict, send_disconnect=False, msg_edit: guilded.Message = None
+    ):
+        channel: guilded.ChatChannel = session["channel"]
+        ws = session["ws"]
+        connection_details = json.loads(json.dumps(self.USER_DATA))
+        connection_details["server"] = {
+            "name": channel.server.name,
+            "id": channel.server.id,
+            "channel": channel.name,
+            "channel_id": (
+                channel.id if not hasattr(channel, "root_id") else channel.root_id
+            ),
+            "icon_url": channel.server.icon.url if channel.server.icon else None,
+            "description": channel.server.description,
+        }
+
+        uuid = session["uuid"]
+        while True:
+            uuid = await self.userphone_client(uuid, channel, connection_details, ws)
+            if type(uuid) != str:
+                break
+        if uuid == 1:
+            if msg_edit:
+                try:
+                    await msg_edit.edit("Already connected!")
+                except:
+                    msg_edit = None
+            if not msg_edit:
+                await channel.send("Already connected!")
+        elif uuid == 2:
+            if msg_edit:
+                try:
+                    await msg_edit.edit("No connection found! Disconnected.")
+                except:
+                    msg_edit = None
+            if not msg_edit:
+                await channel.send("No connection found! Disconnected.")
+        if send_disconnect:
+            try:
+                await channel.send("Userphone hung up.")
+            except guilded.NotFound:
+                pass
+        ws = self.bot.active_userphone_sessions.pop(
+            channel.id if not hasattr(channel, "root_id") else channel.root_id, None
+        )
+        if ws:
+            ws = ws["ws"]
+        if ws:
+            try:
+                await ws.close(1001)
+            except:
+                pass
+        self.bot.active_userphone_sessions.pop(
+            (channel.id if not hasattr(channel, "root_id") else channel.root_id),
+            None,
+        )
+
+    def remove_session_task(self, task):
+        try:
+            self.session_tasks.remove(task)
+        except ValueError as e:
+            print(e)
+            pass
+
+    async def restart_sessions(self):
+        # attempt to reconnect every session
+        for session in self.bot.active_userphone_sessions.values():
+            task = asyncio.create_task(
+                self.userphone_session(session, send_disconnect=True)
+            )
+            task.add_done_callback(self.remove_session_task)
+            self.session_tasks.append(task)
+
+    async def send_message(
+        self, ws, message: guilded.Message, user_data: dict, type: str
+    ):
+        assert type in ["message", "message_edit"]
+        session = self.bot.active_userphone_sessions[
+            (
+                message.channel.id
+                if not hasattr(message.channel, "root_id")
+                else message.channel.root_id
+            )
+        ]["message_id_map"]
+
+        id_map = {msg.id: oid for oid, msg in session.items()}
+
+        converted_replies = [
+            id_map.get(reply, reply) for reply in message.replied_to_ids
+        ]
+
+        def sign_all_content_attachments(message: guilded.Message) -> str:
+            # Replace image links
+            message_content = message.content
+            matches = image_regex.findall(message_content)
+            replacement_counter = 1
+            for url in matches:
+                replacement = f"[Media {replacement_counter}]({guilded.Asset(message._state, url=url, key=guilded.asset.strip_cdn_url(url)).url})"
+                message_content = message_content.replace(f"![]({url})", replacement, 1)
+                replacement_counter += 1
+            return message_content
+
+        message_obj = {
+            "name": user_data["name"],
+            "id": user_data["id"],
+            "message_id": message.id,
+            "nickname": user_data["nickname"],
+            "avatar_url": user_data["avatar_url"],
+            "profile_url": user_data["profile_url"],
+            "reply_ids": converted_replies,
+            "content": {"text": sign_all_content_attachments(message)},
+        }
+        try:
+            await ws.send(
+                json.dumps({"code": 200, "message": message_obj, "detail": type})
+            )
+        except AttributeError:
+            pass  # ws is None
+
+    async def receive_message(self, ws, channel: guilded.ChatChannel):
+        """
+        Client Receives:
+        - `{"code": 429, "detail": "IP Temporarily Banned.", "retry_after": ...}` ✅
+        - `{"code": 200, "detail": "not_connected"}` - while waiting ✅
+        - `{"code": 202, "detail": "Connected.", "user": {...}, "uuid": "..."}` - also on reconnect ✅ (handles connect only)
+        - `{"code": 201, "detail": "Operation sent.", "operation": "...", "message_id": "..."}` - operation one of "message_edit", "message", "message_delete" ✅
+        - `{"code": 200, "detail": "Message received.", "message": {...}}` ✅
+        - `{"code": 200, "detail": "Message edited.", "message": {...}}` ✅
+        - `{"code": 200, "detail": "Message deleted.", "message_id": "..."}` ✅
+        - `{"code": 400, "detail": "not_connected"}` ✅
+        - `{"code": 400, "detail": "unprocessable", "message_id": "..."}` ✅
+        - `{"code": 400, "detail": "invalid_content"}` (invalid content was given to the server) ✅
+        - `{"code": 400, "detail": "already_connected"}` (channel already connected) ✅
+        - `{"code": 404, "detail": "Invalid UUID to reconnect - has it expired?"}` ✅
+        - `{"code": 415, "detail": "Message contains content blocked by other user.", "message_id": "..."}` ✅
+        - `{"code": 418, "detail": "Other user disconnected unintentionally. Wait for possible reconnect.", "time": ...}` ✅
+        - `{"code": 408, "detail": "Max waiting time exceeded."}` ✅
+
+        # Returns
+        - `1` - already connected
+        - `2` - waited too long
+        - `False` - any type of error, shouldn't try to reconnect
+        """
+        while True:
+            try:
+                response = await ws.recv()
+                response_data = json.loads(response)
+
+                if response_data["code"] == 429:
+                    return False  # This shouldn't ever happen as we comply with authentication.
+                if response_data["code"] == 404:
+                    return False  # Reconnect failure.
+                if response_data["code"] == 408:
+                    return 2  # Reconnect failure.
+                if response_data["detail"] == "already_connected":
+                    return 1  # Already connected.
+                if response_data["detail"] == "invalid_content":
+                    print(
+                        response_data
+                    )  # Print it to let developers know, as this shouldn't ever happen. We comply with all userphone standards.
+                elif response_data["code"] == 418:
+                    pass  # The server will send all of our messages anyways. Disconnected user will however not have their messages sent.
+                elif (
+                    response_data["code"] == 400
+                    and response_data["detail"] == "not_connected"
+                ):
+                    pass
+                elif response_data["detail"] == "Operation sent.":
+                    pass
+
+                elif response_data["code"] == 202 and (
+                    self.bot.active_userphone_sessions[
+                        (
+                            channel.id
+                            if not hasattr(channel, "root_id")
+                            else channel.root_id
+                        )
+                    ]["started"]
+                    != True
+                ):
+                    self.bot.active_userphone_sessions[
+                        (
+                            channel.id
+                            if not hasattr(channel, "root_id")
+                            else channel.root_id
+                        )
+                    ]["started"] = True
+                    self.bot.active_userphone_sessions[
+                        (
+                            channel.id
+                            if not hasattr(channel, "root_id")
+                            else channel.root_id
+                        )
+                    ]["uuid"] = response_data["uuid"]
+                    self.bot.active_userphone_sessions[
+                        (
+                            channel.id
+                            if not hasattr(channel, "root_id")
+                            else channel.root_id
+                        )
+                    ]["user"] = response_data["user"]
+                    if not self.bot.active_userphone_sessions[
+                        (
+                            channel.id
+                            if not hasattr(channel, "root_id")
+                            else channel.root_id
+                        )
+                    ]["connected"]:
+                        self.bot.active_userphone_sessions[
+                            (
+                                channel.id
+                                if not hasattr(channel, "root_id")
+                                else channel.root_id
+                            )
+                        ]["connected"] = time.time()
+                    server_name = response_data["user"]["server"]["name"]
+                    channel_name = response_data["user"]["server"]["channel"]
+
+                    embed = guilded.Embed(
+                        title="Connected",
+                        description=f"Connected to **{server_name} - (#{channel_name})**",
+                        color=guilded.Color.purple(),
+                    )
+                    embed.set_author(
+                        name=response_data["user"]["name"],
+                        icon_url=(
+                            response_data["user"]["avatar_url"]
+                            if response_data["user"]["avatar_url"]
+                            else EmptyEmbed
+                        ),
+                    )
+                    if response_data["user"]["server"]["icon_url"]:
+                        embed.set_thumbnail(
+                            url=response_data["user"]["server"]["icon_url"]
+                        )
+                    await channel.send(embed=embed)
+
+                elif response_data["code"] == 200:
+
+                    async def get_embed(content, message_data):
+                        image = await self.find_first_image_or_gif(content)
+                        embed = guilded.Embed(
+                            description=content,
+                            color=guilded.Color.gray(),
+                        )
+                        if image:
+                            embed.set_image(url=image)
+                        embed.set_author(
+                            name=message_data["name"],
+                            icon_url=(
+                                message_data["avatar_url"]
+                                if message_data["avatar_url"]
+                                else EmptyEmbed
+                            ),
+                            url=(
+                                message_data["profile_url"]
+                                if message_data["profile_url"]
+                                else EmptyEmbed
+                            ),
+                        )
+                        return embed
+
+                    if response_data["detail"] == "Message deleted.":
+                        try:
+                            await self.bot.active_userphone_sessions[
+                                (
+                                    channel.id
+                                    if not hasattr(channel, "root_id")
+                                    else channel.root_id
+                                )
+                            ]["message_id_map"].pop(
+                                response_data["message_id"]
+                            ).delete()
+                        except:
+                            pass  # it's gone.
+                    if response_data["detail"] == "Message edited.":
+                        try:
+                            message_data = response_data["message"]
+                            content = message_data["content"]["text"]
+                            blocked = await self.would_be_automodded(
+                                content, channel.server, self.bot
+                            )
+                            if blocked:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "code": 400,
+                                            "message_id": message_data["message_id"],
+                                            "detail": "blocked",
+                                        }
+                                    )
+                                )
+                            else:
+                                embed = await get_embed(content, message_data)
+                                await self.bot.active_userphone_sessions[
+                                    (
+                                        channel.id
+                                        if not hasattr(channel, "root_id")
+                                        else channel.root_id
+                                    )
+                                ]["message_id_map"][
+                                    response_data["message"]["message_id"]
+                                ].edit(
+                                    embed=embed
+                                )
+                        except guilded.NotFound:
+                            pass  # it's gone.
+                    if response_data["detail"] == "Message received.":
+                        message_data = response_data["message"]
+                        content = message_data["content"]["text"]
+                        blocked = await self.would_be_automodded(
+                            content, channel.server, self.bot
+                        )
+                        if blocked:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "code": 400,
+                                        "message_id": message_data["message_id"],
+                                        "detail": "blocked",
+                                    }
+                                )
+                            )
+                        else:
+                            message_data = response_data["message"]
+                            content = message_data["content"]["text"]
+                            embed = await get_embed(content, message_data)
+                            replies = [
+                                self.bot.active_userphone_sessions[
+                                    (
+                                        channel.id
+                                        if not hasattr(channel, "root_id")
+                                        else channel.root_id
+                                    )
+                                ]["message_id_map"].get(msg_id, guilded.Object(msg_id))
+                                for msg_id in message_data["reply_ids"]
+                            ]
+                            if replies == []:
+                                replies = guilded.utils.MISSING
+                            try:
+                                our_message = await channel.send(
+                                    embed=embed,
+                                    silent=True,
+                                    reply_to=replies,
+                                )
+                            except guilded.NotFound:
+                                return False  # Channel doesnt exist??
+                            self.bot.active_userphone_sessions[
+                                (
+                                    channel.id
+                                    if not hasattr(channel, "root_id")
+                                    else channel.root_id
+                                )
+                            ]["message_id_map"][
+                                message_data["message_id"]
+                            ] = our_message
+
+                elif response_data["code"] in [415, 400] and response_data[
+                    "detail"
+                ] in [
+                    "Message contains content blocked by other user.",
+                    "unprocessable",
+                ]:
+                    msg = await channel.fetch_message(response_data["message_id"])
+
+                    await channel.send(
+                        f"Message not sent{' - blocked by other server automod' if response_data['detail'] == 'Message contains content blocked by other user.' else ' - other user rejected.'}.",
+                        reply_to=[msg],
+                    )
+                elif (
+                    response_data["code"] == 200
+                    and response_data["detail"] == "not_connected"
+                ):
+                    pass
+                else:  # We don't handle anything else yet
+                    print(f"Server response: {response_data}")
+
+            except websockets.exceptions.ConnectionClosed as e:
+                if e.code in [1001, 3008, 3000, 3003]:
+                    return False
+                else:
+                    break
+
+    async def userphone_client(
+        self, uuid: str | None, channel: guilded.ChatChannel, auth: dict, ws=None
+    ):
+        """
+        You can assume all keys exist and that they are of the correct type as specified. URLs are validated server side before being sent again.
+
+        Additionally, all message_ids are validated when they are receieved - you will only get a message_edit or message_delete of a previous message. Additionally, you may only send and receive 400s for existing message_ids, and cannot send a 400 for a message_delete.
+
+        Client Receives:
+        - `{"code": 429, "detail": "IP Temporarily Banned.", "retry_after": ...}`
+        - `{"code": 200, "detail": "not_connected"}` - while waiting
+        - `{"code": 202, "detail": "Connected.", "user": {...}, "uuid": "..."}` - also on reconnect
+        - `{"code": 201, "detail": "Operation sent.", "operation": "...", "message_id": "..."}` - detail one of "message_edit", "message", "message_delete"
+        - `{"code": 200, "detail": "Message received.", "message": {...}}`
+        - `{"code": 200, "detail": "Message edited.", "message": {...}}`
+        - `{"code": 200, "detail": "Message deleted.", "message_id": "..."}`
+        - `{"code": 400, "detail": "not_connected"}`
+        - `{"code": 400, "detail": "unprocessable", "message_id": "..."}`
+        - `{"code": 400, "detail": "invalid_content"}` (invalid content was given to the server)
+        - `{"code": 400, "detail": "already_connected"}` (channel already connected)
+        - `{"code": 404, "detail": "Invalid UUID to reconnect - has it expired?"}`
+        - `{"code": 415, "detail": "Message contains content blocked by other user.", "message_id": "..."}`
+        - `{"code": 418, "detail": "Other user disconnected unintentionally. Wait for possible reconnect.", "time": ...}`
+        - `{"code": 408, "detail": "Max waiting time exceeded."}` - 1001 disconnect
+        - `1001 - Disconnected`
+        - `3008 - No activity on one side for > 120s`
+        - `3000 - Unauthorized`
+        - `3003 - Forbidden`
+
+        Server Receives:
+        - `{"code": 200, "user": {...}, "detail": "auth"}`
+        - `{"code": 200, "message": {...}, "detail": "message"}`
+        - `{"code": 200, "message": {...}, "detail": "message_edit"}`
+        - `{"code": 200, "message_id": "...", "detail": "message_delete"}`
+        - `{"code": 400, "message_id": "...", "detail": "unprocessable"}` - Client could not process message.
+        - `{"code": 400, "message_id": "...", "detail": "blocked"}` - Contains blocked content.
+        - `1001 - Disconnected`
+
+        User Object:
+        ```json
+            {
+                "authentication": "...",
+                "name": "Crystal",
+                "id": "daOBjZZA",
+                "description": null,
+                "avatar_url": null,
+                "server": {
+                    "name": "Codeverse",
+                    "id": "...",
+                    "channel": "general",
+                    "channel_id": "...",
+                    "icon_url": null,
+                    "description": null
+                }
+            }
+        ```
+
+        Message Object:
+        ```json
+            {
+                "name": "YumYummity",
+                "id": "4WG7wrP4",
+                "message_id": "...",
+                "nickname": null,
+                "avatar_url": null,
+                "profile_url": null,
+                "reply_ids": ["you may put other message ids in here, but the server will strip ids not sent during userphone session"],
+                "content": {
+                    "text": "Hello World",
+                }
+            }
+        ```
+        """
+
+        async def begin():
+            self.bot.active_userphone_sessions[
+                channel.id if not hasattr(channel, "root_id") else channel.root_id
+            ] = {
+                "ws": ws,
+                "uuid": uuid,
+                "channel": channel,
+                "started": time.time(),
+                "connected": None,
+                "message_id_map": {},
+                "user": None,
+            }
+            resp = await self.receive_message(ws, channel)
+            if resp == False:
+                self.bot.active_userphone_sessions.pop(
+                    channel.id if not hasattr(channel, "root_id") else channel.root_id,
+                    0,
+                )
+                try:
+                    await ws.close(1001)
+                except:
+                    pass
+                return None
+            elif type(resp) == int:
+                return resp  # 1 is already connected, 2 is waited too long
+            else:
+                try:
+                    await ws.close(1000)  # unintentional
+                except:
+                    pass
+                return self.bot.active_userphone_sessions[
+                    channel.id if not hasattr(channel, "root_id") else channel.root_id
+                ]["uuid"]
+
+        uri = self.uri
+        print(uri)
+        if uuid:
+            uri = f"{self.uri}?id={uuid}"
+        if not uuid or (ws and not ws.open):
+            ws = None
+        if not ws:
+            async with websockets.connect(uri, ping_timeout=180) as ws:
+                # Send authentication
+                if not uuid:
+                    await ws.send(
+                        json.dumps({"code": 200, "user": auth, "detail": "auth"})
+                    )
+
+                res = await begin()
+                return res
+        else:
+            res = await begin()
+            return res
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, event: guilded.MessageDeleteEvent):
+        if event.channel.id in self.bot.active_userphone_sessions:
+            try:
+                session = self.bot.active_userphone_sessions[
+                    (
+                        event.channel.id
+                        if not hasattr(event.channel, "root_id")
+                        else event.channel.root_id
+                    )
+                ]
+                if not session["connected"]:
+                    return
+                if (
+                    event.author_id == self.bot.user_id
+                ):  # Specially handle self deletes.
+                    message_map = self.bot.active_userphone_sessions[
+                        (
+                            event.channel.id
+                            if not hasattr(event.channel, "root_id")
+                            else event.channel.root_id
+                        )
+                    ]["message_id_map"]
+
+                    key_to_delete = next(
+                        (k for k, v in message_map.items() if v == event.message_id),
+                        None,
+                    )
+
+                    if key_to_delete is not None:
+                        self.bot.active_userphone_sessions[
+                            (
+                                event.channel.id
+                                if not hasattr(event.channel, "root_id")
+                                else event.channel.root_id
+                            )
+                        ]["message_id_map"].pop(key_to_delete)
+                    return
+                if (
+                    event.message.created_at.timestamp() < session["connected"]
+                ):  # message was earlier than connected time, therefore not in userphone
+                    return
+                ws = session["ws"]
+                await ws.send(
+                    json.dumps(
+                        {
+                            "code": 200,
+                            "message_id": event.message_id,
+                            "detail": "message_delete",
+                        }
+                    )
+                )
+            except websockets.ConnectionClosedOK:
+                pass
+
+    @commands.Cog.listener()
+    async def on_message_update(self, event: guilded.MessageUpdateEvent):
+        if event.after.channel.id in self.bot.active_userphone_sessions:
+            try:
+                session = self.bot.active_userphone_sessions[
+                    (
+                        event.after.channel.id
+                        if not hasattr(event.after.channel, "root_id")
+                        else event.after.channel.root_id
+                    )
+                ]
+                if not session["connected"]:
+                    return
+                if (
+                    event.after.created_at.timestamp() < session["connected"]
+                ):  # message was earlier than connected time, therefore not in userphone
+                    return
+                if (
+                    event.after.content == ""
+                    or event.after.author.id == self.bot.user_id
+                ):
+                    return
+                ws = session["ws"]
+                user_data = {
+                    "name": (
+                        event.after.author.name
+                        if event.after.author_id != "Ann6LewA"
+                        else "SERVER WEBHOOK"
+                    ),
+                    "id": event.after.author_id,
+                    "nickname": event.after.author.nick,
+                    "avatar_url": event.after.author.display_avatar.url,
+                    "profile_url": event.after.author.profile_url,
+                }
+                await self.send_message(ws, event.after, user_data, type="message_edit")
+            except websockets.ConnectionClosedOK:
+                pass
+
+    @commands.Cog.listener()
+    async def on_message(self, event: guilded.MessageEvent):
+        if event.channel.id in self.bot.active_userphone_sessions:
+            try:
+                session = self.bot.active_userphone_sessions[
+                    (
+                        event.channel.id
+                        if not hasattr(event.channel, "root_id")
+                        else event.channel.root_id
+                    )
+                ]
+                if (
+                    event.content == ""
+                    or event.author.id == self.bot.user_id
+                ):
+                    return
+                ws = session["ws"]
+                user_data = {
+                    "name": (
+                        event.author.name
+                        if event.author_id != "Ann6LewA"
+                        else "SERVER WEBHOOK"
+                    ),
+                    "id": event.author_id,
+                    "nickname": event.author.nick,
+                    "avatar_url": event.author.display_avatar.url,
+                    "profile_url": event.author.profile_url,
+                }
+                await self.send_message(ws, event, user_data, type="message")
+            except websockets.ConnectionClosedOK:
+                pass
+
+    @commands.command(name="channelphone")
+    @commands.cooldown(rate=1, per=2, type=commands.BucketType.channel)
+    async def start_userphone(self, ctx: commands.Context):
+        check = await checksfrfr.enabled(ctx, ctx.command.name)
+        if not check:
+            return
+        """
+        Command Usage: `{qualified_name}`
+
+        -----------
+
+        `{prefix}{qualified_name}` - Start a userphone in the current channel.
+        """
+        if ctx.message.private:
+            return await ctx.reply("Cannot be private.", private=ctx.message.private)
+
+        if ctx.channel.id in self.bot.active_userphone_sessions:
+            if (
+                self.bot.active_userphone_sessions[
+                    (
+                        ctx.channel.id
+                        if not hasattr(ctx.channel, "root_id")
+                        else ctx.channel.root_id
+                    )
+                ]["user"]
+                == None
+            ):
+                return await ctx.reply(
+                    "Userphone is already ringing.", private=ctx.message.private
+                )
+            else:
+                user = self.bot.active_userphone_sessions[
+                    (
+                        ctx.channel.id
+                        if not hasattr(ctx.channel, "root_id")
+                        else ctx.channel.root_id
+                    )
+                ]["user"]
+                server_name = user["server"]["name"]
+                channel_name = user["server"]["channel"]
+
+                embed = guilded.Embed(
+                    title="Already Connected!",
+                    description=f"Currently connected to **{server_name} - (#{channel_name})**",
+                    color=guilded.Color.purple(),
+                )
+                embed.set_author(
+                    name=user["name"],
+                    icon_url=(user["avatar_url"] if user["avatar_url"] else EmptyEmbed),
+                )
+                if user["server"]["icon_url"]:
+                    embed.set_thumbnail(url=user["server"]["icon_url"])
+                return await ctx.reply(embed=embed, private=ctx.message.private)
+
+        msg = await ctx.reply(
+            "Calling userphone... If no connection is found in 5 minutes this will automatically fail."
+        )
+
+        self.bot.active_userphone_sessions[
+            (
+                ctx.channel.id
+                if not hasattr(ctx.channel, "root_id")
+                else ctx.channel.root_id
+            )
+        ] = {
+            "ws": None,
+            "uuid": None,
+            "channel": ctx.channel,
+            "started": time.time(),
+            "connected": None,
+            "message_id_map": {},
+            "user": None,
+        }
+
+        await asyncio.sleep(3)
+
+        task = asyncio.create_task(
+            self.userphone_session(
+                {
+                    "ws": None,
+                    "uuid": None,
+                    "channel": ctx.channel,
+                    "started": time.time(),
+                    "connected": None,
+                    "message_id_map": {},
+                    "user": None,
+                },
+                send_disconnect=True,
+                msg_edit=msg,
+            )
+        )
+        task.add_done_callback(self.remove_session_task)
+        self.session_tasks.append(task)
+
+    @commands.command(name="changup")
+    @commands.cooldown(rate=1, per=2, type=commands.BucketType.channel)
+    async def disconnect_userphone(self, ctx: commands.Context):
+        check = await checksfrfr.enabled(ctx, ctx.command.name)
+        if not check:
+            return
+        """
+        Command Usage: `{qualified_name}`
+
+        -----------
+
+        `{prefix}{qualified_name}` - Disconnect from userphone if it's on in the current channel.
+        """
+        if ctx.channel.id in self.bot.active_userphone_sessions:
+            session = self.bot.active_userphone_sessions.pop(
+                ctx.channel.id
+                if not hasattr(ctx.channel, "root_id")
+                else ctx.channel.root_id
+            )
+            ws = session["ws"]
+            try:
+                await ws.close(1001)
+            except:
+                pass
+        else:
+            await ctx.send("No active userphone session found in this channel.")
+
+    def cog_unload(self):
+        for task in self.session_tasks:
+            task.cancel()
+
+
+def setup(bot):
+    bot.add_cog(Channelphone(bot))

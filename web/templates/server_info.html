@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Server Info</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+        }
+        h1 {
+            color: #bb86fc;
+        }
+        a {
+            color: #03dac6;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        img {
+            border-radius: 50%;
+        }
+    </style>
+</head>
+<body>
+    <h1>Server Info</h1>
+    <p>Name: {{ server.name }}</p>
+    <p>ID: {{ server.id }}</p>
+    <p>Member Count: {{ server.member_count }}</p>
+    <p>Owner: {{ owner.name }}</p>
+    {% if server.icon %}
+    <p><img src="{{ server.icon }}" alt="Server Icon" width="100" height="100"></p>
+    {% else %}
+    <p>No Server Icon</p>
+    {% endif %}
+    <a href="/?page={{ request.args.get('page', 1) }}&search={{ request.args.get('search', '') }}">Back to Dashboard</a>
+</body>
+</html>

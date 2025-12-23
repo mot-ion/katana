@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+        }
+        h1, h2 {
+            color: #bb86fc;
+        }
+        a {
+            color: #03dac6;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        form {
+            margin-bottom: 20px;
+        }
+        input[type="text"], input[type="number"] {
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            margin-right: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            background-color: #03dac6;
+            color: #121212;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #018786;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        li {
+            margin: 10px 0;
+            display: flex;
+            align-items: center;
+        }
+        img {
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+        .pagination {
+            margin-top: 20px;
+        }
+        .pagination span {
+            margin: 0 10px;
+        }
+    </style>
+    <script>
+        function formatTime(seconds) {
+            const hrs = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+            return `${hrs}h ${mins}m ${secs}s`;
+        }
+
+        function updateUptime() {
+            const uptimeElement = document.getElementById('uptime');
+            let uptimeSeconds = parseInt(uptimeElement.dataset.seconds, 10);
+
+            setInterval(() => {
+                uptimeSeconds += 1;
+                uptimeElement.innerText = formatTime(uptimeSeconds);
+            }, 1000);
+        }
+
+        window.onload = () => {
+            const uptimeElement = document.getElementById('uptime');
+            const initialUptime = uptimeElement.innerText.split(':');
+            const initialSeconds = parseInt(initialUptime[0], 10) * 3600 + parseInt(initialUptime[1], 10) * 60 + parseInt(initialUptime[2], 10);
+            uptimeElement.dataset.seconds = initialSeconds;
+            updateUptime();
+        };
+    </script>
+</head>
+<body>
+    <h1>Admin Dashboard</h1>
+    <p>Bot Uptime: <span id="uptime">{{ uptime }}</span></p>
+    <p>Total Servers: {{ total_servers }}</p>
+    <form method="get" action="/">
+        <input type="text" name="search" placeholder="Search by server name or ID" value="{{ search_query }}">
+        <button type="submit">Search</button>
+    </form>
+    <h2>Servers</h2>
+    <ul>
+        {% for server in servers %}
+        <li>
+            {% if server.icon %}
+            <img src="{{ server.icon }}" alt="Server Icon" width="40" height="40">
+            {% endif %}
+            <a href="/server/{{ server.id }}?page={{ page }}&search={{ search_query }}">{{ server.name }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="/?page=1&search={{ search_query }}">First</a>
+        <a href="/?page={{ page - 1 }}&search={{ search_query }}">Previous</a>
+        {% endif %}
+        <span>Page {{ page }} of {{ total_pages }}</span>
+        {% if page < total_pages %}
+        <a href="/?page={{ page + 1 }}&search={{ search_query }}">Next</a>
+        <a href="/?page={{ total_pages }}&search={{ search_query }}">Last</a>
+        {% endif %}
+    </div>
+    <form method="get" action="/" style="margin-top: 20px;">
+        <input type="number" name="page" min="1" max="{{ total_pages }}" placeholder="Go to page" required>
+        <input type="hidden" name="search" value="{{ search_query }}">
+        <button type="submit">Go</button>
+    </form>
+</body>
+</html>
